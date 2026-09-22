@@ -1,0 +1,33 @@
+parameters:
+  - name: stageName
+    type: string
+  - name: displayName
+    type: string
+  - name: targetBranch
+    type: string
+  - name: environmentName
+    type: string
+  - name: appName
+    type: string
+  - name: resourceGroup
+    type: string
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: BuildAndRelease
+    condition: and(succeeded(), in(variables['Build.SourceBranch'], '${{ parameters.targetBranch }}'))
+    jobs:
+      - deployment: DeployApp
+        displayName: 'Deploy to ${{ parameters.environmentName }}'
+        environment: ${{ parameters.environmentName }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureContainerApps@1
+                  inputs:
+                    azureSubscription: 'azure-resource-connection'
+                    containerAppName: ${{ parameters.appName }}
+                    resourceGroup: ${{ parameters.resourceGroup }}
+                    imageToDeploy: '$(ACR_NAME).azurecr.io/$(IMAGE_REPOSITORY):$(Build.SourceVersion)'

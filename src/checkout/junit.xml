@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="12" failures="3" errors="0" time="51.373">
+  <testsuite name="Chaos Integration Tests" errors="0" failures="0" skipped="0" timestamp="2026-09-16T06:55:53" time="41.043" tests="9">
+    <testcase classname="Chaos Integration Tests Health Check should return DOWN when chaos is enabled" name="Chaos Integration Tests Health Check should return DOWN when chaos is enabled" time="0.085">
+    </testcase>
+    <testcase classname="Chaos Integration Tests Health Check should return UP when chaos is disabled" name="Chaos Integration Tests Health Check should return UP when chaos is disabled" time="0.008">
+    </testcase>
+    <testcase classname="Chaos Integration Tests Latency should delay requests when latency is enabled" name="Chaos Integration Tests Latency should delay requests when latency is enabled" time="1.023">
+    </testcase>
+    <testcase classname="Chaos Integration Tests Latency should not delay chaos endpoints" name="Chaos Integration Tests Latency should not delay chaos endpoints" time="0.01">
+    </testcase>
+    <testcase classname="Chaos Integration Tests Error Status should return error status when enabled" name="Chaos Integration Tests Error Status should return error status when enabled" time="0.021">
+    </testcase>
+    <testcase classname="Chaos Integration Tests Error Status should validate error status input" name="Chaos Integration Tests Error Status should validate error status input" time="0.011">
+    </testcase>
+    <testcase classname="Chaos Integration Tests Input Validation should validate latency input" name="Chaos Integration Tests Input Validation should validate latency input" time="0.01">
+    </testcase>
+    <testcase classname="Chaos Integration Tests Input Validation should validate status code input" name="Chaos Integration Tests Input Validation should validate status code input" time="0.011">
+    </testcase>
+    <testcase classname="Chaos Integration Tests Chaos Status should return current chaos configuration" name="Chaos Integration Tests Chaos Status should return current chaos configuration" time="0.032">
+    </testcase>
+  </testsuite>
+  <testsuite name="AppController (e2e)" errors="0" failures="3" skipped="0" timestamp="2026-09-16T06:55:53" time="48.074" tests="3">
+    <testcase classname="AppController (e2e) /health (GET)" name="AppController (e2e) /health (GET)" time="0.019">
+      <failure>Error: Could not find a working container runtime strategy
+    at getContainerRuntimeClient (/app/node_modules/testcontainers/src/container-runtime/clients/client.ts:63:9)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at GenericContainer.start (/app/node_modules/testcontainers/src/generic-container/generic-container.ts:87:20)
+    at Object.&lt;anonymous&gt; (/app/test/app.e2e-spec.ts:34:22)</failure>
+    </testcase>
+    <testcase classname="AppController (e2e) /checkout/test123 (GET)" name="AppController (e2e) /checkout/test123 (GET)" time="0">
+      <failure>Error: Could not find a working container runtime strategy
+    at getContainerRuntimeClient (/app/node_modules/testcontainers/src/container-runtime/clients/client.ts:63:9)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at GenericContainer.start (/app/node_modules/testcontainers/src/generic-container/generic-container.ts:87:20)
+    at Object.&lt;anonymous&gt; (/app/test/app.e2e-spec.ts:34:22)</failure>
+    </testcase>
+    <testcase classname="AppController (e2e) /checkout/test124 (POST)" name="AppController (e2e) /checkout/test124 (POST)" time="0">
+      <failure>Error: Could not find a working container runtime strategy
+    at getContainerRuntimeClient (/app/node_modules/testcontainers/src/container-runtime/clients/client.ts:63:9)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at GenericContainer.start (/app/node_modules/testcontainers/src/generic-container/generic-container.ts:87:20)
+    at Object.&lt;anonymous&gt; (/app/test/app.e2e-spec.ts:34:22)</failure>
+    </testcase>
+    <testcase classname=" Test execution failure: could be caused by test hooks like &apos;afterAll&apos;." name=" Test execution failure: could be caused by test hooks like &apos;afterAll&apos;." time="0">
+      <failure>{&quot;message&quot;:&quot;&quot;,&quot;stack&quot;:&quot;TypeError: Cannot read properties of undefined (reading &apos;close&apos;)\n    at Object.&lt;anonymous&gt; (/app/test/app.e2e-spec.ts:66:15)\n    at Promise.finally.completed (/app/node_modules/jest-circus/build/jestAdapterInit.js:1559:28)\n    at new Promise (&lt;anonymous&gt;)\n    at callAsyncCircusFn (/app/node_modules/jest-circus/build/jestAdapterInit.js:1499:10)\n    at _callCircusHook (/app/node_modules/jest-circus/build/jestAdapterInit.js:978:40)\n    at processTicksAndRejections (node:internal/process/task_queues:95:5)\n    at _runTestsForDescribeBlock (/app/node_modules/jest-circus/build/jestAdapterInit.js:856:7)\n    at _runTestsForDescribeBlock (/app/node_modules/jest-circus/build/jestAdapterInit.js:829:11)\n    at run (/app/node_modules/jest-circus/build/jestAdapterInit.js:757:3)\n    at runAndTransformResultsToJestFormat (/app/node_modules/jest-circus/build/jestAdapterInit.js:1920:21)\n    at jestAdapter (/app/node_modules/jest-circus/build/runner.js:101:19)\n    at runTestInternal (/app/node_modules/jest-runner/build/testWorker.js:272:16)\n    at runTest (/app/node_modules/jest-runner/build/testWorker.js:340:7)\n    at Object.worker (/app/node_modules/jest-runner/build/testWorker.js:494:12)&quot;}</failure>
+    </testcase>
+  </testsuite>
+</testsuites>

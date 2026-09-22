@@ -1,0 +1,528 @@
+
+ # We created build validation branch policy because in Azure Repos, this is the only mechanism that links Pull Requests to your pipeline and locks the merge button if checks fail.
+# YAML file (trigger:): Runs when someone does a git push to dev/main/staging. It runs against that single commit to give the author personal feedback.
+# Build Validation Policy (UI): Runs when someone opens or updates a PR targeting this branch. It evaluates the virtual merge commit and blocks anyone from clicking "Complete Merge" until tests, coverage, and linting pass.
+# What This Policy Does Specifically
+# It simulates merging the feature branch into the target branch behind the scenes and runs the pipeline against that combined state. If another developer merged conflicting code 5 minutes earlier, this catches the failure before merge.
+# When someone opens a PR that only modifies documentation or another microservice, Azure DevOps automatically marks this policy as Not Applicable and lets the PR merge without wasting agent build minutes.
+# Because it is set to Required, developers cannot bypass broken tests
+
+# M2 resides in Windows user profile folder:C:\Users\<YourUsername>\.m2 (e.g., C:\Users\dravucan\.m2).
+# In Azure DevOps pipeline:MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository. 
+# During pipeline runs on the Linux VM, it sits at /home/vsts/work/1/.m2/repository (one folder above your Git workspace .../work/1/s).  
+# Inside the Trivy Docker container:We mounted $(MAVEN_CACHE_FOLDER) to /root/.m2:ro.
+# Inside Linux containers, root applications expect default Maven caches in /root/.m2.
+# The .m2 folder serves as Maven's centralized local storage and configuration hub:repository/ (The Local Dependency Cache):This subfolder holds every Java dependency, plugin, parent POM, and BOM that Maven downloads from Maven Central. Files are structured hierarchically by group, artifact, and version. 
+# For example:  Plaintextrepository/
+# └── org/
+#     └── springframework/
+#         └── boot/
+#             └── spring-boot-starter-web/
+#                 └── 3.2.0/
+#                    ├── spring-boot-starter-web-3.2.0.jar
+#                    └── spring-boot-starter-web-3.2.0.pom
+
+# Once Maven downloads a library into repository/, it never re-downloads it over the network as long as the version remains unchanged.
+# settings.xml (Optional User Configuration):Contains local environment configurations, such as custom mirror URLs, private company artifact registry credentials (like Azure Artifacts or Nexus), or corporate HTTP proxy settings.ts or failing Checkstyle rules to merge code.
+
+
+
+
+
+
+trigger:
+  branches:
+    include:
+      - dev
+      - main
+      - staging
+  paths:
+    include:
+      - src/cart/**
+      - .azure-pipelines/cart-ci.yml
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # Store maven dependecies so subsequent stage, which is isolated, can interact with it
+  MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
+  ACR_SERVICE_CONNECTION: 'AKS-Connection' # Name of your Azure DevOps Docker Service Connection
+  ACR_LOGIN_SERVER: 'my2026registry.azurecr.io'
+  IMAGE_REPOSITORY: 'cart' # Name of your Azure Container Registry Repository
+  WORKING_DIR: 'src/cart'
+stages:
+  # =============================================================
+  # STAGE 1: Fast Feedback (Runs on EVERY push AND every MR)
+  # =============================================================
+  - stage: Validate
+    displayName: 'Test, Coverage & Lint'
+    jobs:
+      - job: TestAndLint
+        steps:
+          - task: JavaToolInstaller@0
+            inputs:
+              versionSpec: '21'
+              jdkArchitectureOption: 'x64'
+              jdkSourceOption: 'PreInstalled'
+
+          # Cache Maven repository so dependencies persist across pipeline runs
+          # This task persists downloaded Maven dependencies and POM files across pipeline runs using Azure DevOps cloud caching. Because Microsoft-hosted pipeline agents are ephemeral VMs that get destroyed after every run, this task ensures subsequent builds do not start with an empty cache.
+          # The cache survives because it is not stored on the virtual machine's local disk. Instead, it is stored in Azure DevOps' centralized, cloud-backed Pipeline Cache Service (backed by Azure Blob Storage).
+          # path:$(MAVEN_CACHE_FOLDER): Tells the agent which directory to save and restore. Maven downloads all dependencies, BOMs, and parent POMs into this directory by default.
+          # key: 'maven | "$(Agent.OS)" | **/pom.xml': The primary lookup key. Azure DevOps calculates a cryptographic hash of all pom.xml files in the repository.
+          # If the dependencies listed in your POM files haven't changed, Azure DevOps restores the exact matching cache at the start of the job.
+          # If a dependency is added or modified, the hash changes, resulting in a cache miss; Maven downloads the new packages, and the task saves a new cache at the end of the build.
+          # restoreKeys: | maven | "$(Agent.OS)": The fallback key. If the primary key misses (e.g., you bumped one library version in pom.xml), Azure DevOps falls back to restoring the most recent cache matching this prefix. Maven only needs to download the single updated dependency rather than everything from scratch.
+          # The 429 error occurs because shared Microsoft-hosted Azure IP pools exceed Maven Central's public request quotas when querying POM hierarchies from scratch.
+          - task: Cache@2
+            displayName: 'Cache Maven Dependencies'
+            inputs:
+              key: 'maven | "$(Agent.OS)" | $(WORKING_DIR)/pom.xml'
+              restoreKeys: |
+                maven | "$(Agent.OS)"
+              path: $(MAVEN_CACHE_FOLDER)
+# clean: Deletes the target/ directory to wipe any cached class files or prior test outputs.
+# test: Compiles production code (src/main), compiles test classes (src/test), and runs all unit tests via the Maven Surefire plugin. If JaCoCo is configured, it records coverage metrics during this execution.
+# -B or --batch-mode Suppresses interactive prompts and prevents Maven from printing noisy download progress bars (which clutter CI logs with thousands of lines).
+# -D<property>=<value> Defines system or build properties. For example:
+# -Dmaven.repo.local=$(MAVEN_CACHE_FOLDER): Forces Maven to download dependencies to a specific folder so Azure DevOps can cache them between runs.
+# -Dtest=SpecificTestClass: Runs only one test class.
+#-q or --quiet
+# -X or --debug Enables full verbose debug logging, useful for diagnosing compilation or dependency resolution failures.
+# -P<profile-id> Activates an explicit Maven profile defined in pom.xml.
+# Unit test app runs: src/cart/src/test/java folder and subfolders
+
+# Run All Tests (Standard Maven Command)
+#mvn test
+# Executes all four test suites sequentially.
+# Run Only Fast/Non-Database Tests (Skip PostgreSQL & Testcontainers)
+# If you want to run only in-memory tests without spinning up Docker:
+# mvn test -Dtest=OrdersApplicationTests,OrdersMetricsTests
+# Run Only the Postgres Integration Test
+# mvn test -Dtest=OrderServicePostgresTests
+# Run All Except Chaos Tests
+# mvn test -Dtest=!ChaosIntegrationTests
+
+# In orders service, Testcontainers spun up PostgreSQL, which uses standard JDBC drivers.
+# However, in cart service, we have DynamoDBCartServiceIntegrationTests.java. This test uses Testcontainers
+# to spin up a local instance of AWS DynamoDB (DynamoDB Local or LocalStack).
+# The problem is the AWS Java SDK. Even if we configure test to point to a local Docker container at http://localhost:8000,
+# the AWS SDK performs strict credential checks on startup. If it cannot find an active AWS Region and Access Key, it will immediately crash your application before the tests even run.
+
+
+          - script: |
+              cd $(WORKING_DIR)
+              chmod +x mvnw
+              ./mvnw clean test -Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)
+            
+            env:
+              AWS_REGION: 'eu-central-1'
+              AWS_DEFAULT_REGION: 'eu-central-1'
+              AWS_ACCESS_KEY_ID: 'dummy-key'
+              AWS_SECRET_ACCESS_KEY: 'dummy-secret'
+            displayName: 'Run Unit Tests'
+
+          
+# This command runs static code analysis (linting) against Java code using the Maven Wrapper.
+# ./mvnw Invokes the Maven Wrapper executable script in the current directory. Instead of relying on a system-wide Maven installation, it uses the specific, pinned Maven distribution configured in .mvn/wrapper/maven-wrapper.properties.
+# checkstyle:check Follows Maven's standard <plugin-prefix>:<goal> invocation format:
+# checkstyle: Maven resolves this prefix to the maven-checkstyle-plugin declared in cart/pom.xml.
+# check: The specific goal within the plugin that performs the inspection and evaluates whether the build should pass or fail.
+
+# ./mvnw clean test triggers the Maven Surefire plugin. Surefire automatically searches for and executes any
+# file ending in Tests.java or Test.java.
+# Surefire will automatically run:
+# ChaosIntegrationTests.java
+# DynamoDBCartServiceIntegrationTests.java
+# CartsControllerTests.java
+# CartsApplicationTests.java
+# What it skips:
+#TestUtil.java: Because it does not end in Test or Tests, Maven knows this is just a helper/utility class and does not try to execute it as a test suite.
+#AbstractServiceTests.java: JUnit automatically skips abstract classes, using them only as base classes
+# for other tests to inherit from.
+
+
+          - script: |
+              cd $(WORKING_DIR)
+              ./mvnw checkstyle:check -Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)
+            displayName: 'Run Checkstyle'
+
+            # When the previous step executed ./mvnw clean test, Maven automatically:
+            # Created the src/cart/target/ directory.
+            # By default, Surefire writes test reports to ${project.build.directory}/surefire-reports/, which maps to:
+            # src/cart/target/surefire-reports/
+            # Inside that folder, it writes an XML file per test class formatted to standard JUnit schemas:
+            # TEST-com.amazon.sample.carts.web.CartsControllerTests.xml
+            # TEST-com.amazon.sample.carts.domain.CartItemTests.xml
+            # Compiled your classes into target/classes.
+            # Ran the tests using Maven's built-in maven-surefire-plugin.
+            # Wrote an individual JUnit-compatible XML report for each test class inside src/cart/target/surefire-reports/ (e.g., TEST-com.amazon.sample.carts.web.CartsControllerTests.xml).
+            # src/cart/target/surefire-reports was created automatically during the ./mvnw clean test step by Maven Surefire Plugin
+            # to store test results in JUnit XML format. Each file is named TEST-<fully-qualified-class-name>.xml, containing detailed information about the test execution, including passed, failed, and skipped tests.
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '$(WORKING_DIR)/target/surefire-reports/TEST-*.xml'
+            condition: always()
+
+# Maven will create jacco.xml only if jacoco plugin is configured in pom.xml
+
+# <plugin>
+#   <groupId>org.jacoco</groupId>
+#   <artifactId>jacoco-maven-plugin</artifactId>
+#   <version>0.8.12</version>
+#   <executions>
+#     <execution>
+#       <goals>
+#         <goal>prepare-agent</goal>
+#       </goals>
+#     </execution>
+#     <execution>
+#       <id>report</id>
+#       <phase>test</phase>
+#       <goals>
+#         <goal>report</goal>
+#       </goals>
+#     </execution>
+#   </executions>
+# </plugin>
+
+
+
+          - task: PublishCodeCoverageResults@2
+            inputs:
+              summaryFileLocation: '$(WORKING_DIR)/target/site/jacoco/jacoco.xml'
+              pathToSources: '$(System.DefaultWorkingDirectory)/$(WORKING_DIR)/src/main/java'
+            condition: succeededOrFailed()
+
+  # =============================================================
+  # STAGE 2: Security Gates (Runs ONLY when an MR is opened/updated)
+  # =============================================================
+
+  # Run this step if previous one succedeed and if MR/PR is opened
+  - stage: Security
+    displayName: 'Security Gates (MR Only)'
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: SecurityScans
+        displayName: 'SAST, SCA & Secret Detection'
+        steps:
+         
+          - task: JavaToolInstaller@0
+            inputs:
+              versionSpec: '21'
+              jdkArchitectureOption: 'x64'
+              jdkSourceOption: 'PreInstalled'
+
+          # Secret Detection
+          # Mounts repository on the host machine ($(Build.SourcesDirectory)) into the container's filesystem at /repo so Gitleaks can read code and Git history.
+          # Required so ./mvnw dependency:resolve can run on this agent
+          
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/gitleaks-reports
+
+              docker run --rm \
+                -v $(Build.SourcesDirectory):/repo:ro \
+                -v $(Build.ArtifactStagingDirectory)/gitleaks-reports:/reports \
+                zricethezav/gitleaks:latest detect \
+                --source="/repo" \
+                -v --redact \
+                --report-path="/reports/gitleaks-report.json" \
+                --report-format="json"
+            continueOnError: true
+            displayName: 'Secret Detection (Gitleaks)'
+            
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Gitleaks Report'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/gitleaks-reports'
+              artifact: 'SecurityReports'
+              publishLocation: 'pipeline'
+            condition: always() # Publishes even if secrets were detected and the scan failed
+
+         # Download all dependencies, parent POMs, and BOMs locally, as in the previous stage. This ensures that Trivy can scan the pom.xml file without needing to make any network calls to Maven Central. It pre-fetches all dependencies and stores them in the local Maven repository (~/.m2/repository).
+          - task: Cache@2
+            displayName: 'Cache Maven Local Repo'
+            inputs:
+              key: 'maven | "$(Agent.OS)" | $(WORKING_DIR)/pom.xml'
+              restoreKeys: |
+                maven | "$(Agent.OS)"
+              path: $(MAVEN_CACHE_FOLDER)
+
+          # Download all dependencies, parent POMs, and BOMs locally
+          # This step ensures that Trivy can scan the pom.xml file without needing to make any network calls to Maven Central. It pre-fetches all dependencies and stores them in the local Maven repository (~/.m2/repository).
+          # dependency:resolve: Tells the Maven Dependency Plugin to inspect your pom.xml, calculate the full dependency tree, and download all direct and transitive dependencies (including parent POMs and BOMs) to the local repository.
+          - script: |
+              cd $(Build.SourcesDirectory)/$(WORKING_DIR)
+              chmod +x mvnw
+              ./mvnw dependency:resolve -Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)
+            displayName: 'Pre-fetch Maven Dependencies'
+
+    # This task runs the Trivy vulnerability scanner inside an isolated Docker container to inspect
+    # Java dependencies for HIGH and CRITICAL vulnerabilities. Instead of terminating the pipeline when
+    # vulnerabilities are found, it converts the failure into an Azure DevOps warning badge (yellow icon) and saves a machine-readable SARIF report.
+    # Containers run in complete isolation from the build agent's filesystem. Without volume mounts (-v host_path:container_path), Trivy cannot read your code or save its results to the agent disk.
+    # Volume 1: -v $(MAVEN_CACHE_FOLDER):/root/.m2:ro (Local Cache resolution)
+    # Shares cached dependencies and parent POMs with Trivy in read-only (:ro) mode.
+    # A pom.xml rarely contains all version numbers—it inherits versions from parent POMs. When Trivy parses the dependency tree, it looks inside the default Maven repository path (/root/.m2). Mounting cached folder gives Trivy instant offline access to resolved metadata without re-downloading packages from Maven Central.
+    # Volume 2: -v $(Build.SourcesDirectory)/src/cart/pom.xml:/pom.xml (Scanner Target)
+    # Mounts the specific service manifest file from the host directly to /pom.xml inside the container.
+    # Trivy runs in filesystem mode (trivy fs /pom.xml). Mounting this specific file allows Trivy to scan the cart service manifest without granting the container access to entire repository.
+    # Volume 3: -v $(Build.ArtifactStagingDirectory)/trivy-reports:/reports (Report Persistence)
+    # Links an output directory on the agent host to /reports inside the container.
+    # Git repository lives in $(Build.SourcesDirectory) (.../work/1/s). Writing report files to the staging folder (.../work/1/a) ensures generated scan files never contaminate your clean Git workspace, interfere with source diffs, or accidentally get packaged into final application JARs or Docker images.
+    # The container uses --rm, which permanently destroys the container and its internal filesystem as soon as it finishes.
+    # By writing the SARIF output to /reports/trivy-report.sarif, the file lands safely on the host agent disk in $(Build.ArtifactStagingDirectory) so subsequent pipeline steps can publish it as an artifact.
+    # set +e: Disables bash's default "fail immediately on error" behavior in Azure Pipelines.
+    # Because Trivy is passed --exit-code 1, it exits with status code 1 whenever a HIGH or CRITICAL issue is found.
+    # Without set +e, the bash script would abort on the docker run command, failing the build immediately.
+    # SCAN_EXIT=$? & set -e: Stores Trivy's actual exit status in a variable for evaluation, then restores standard shell error-checking behavior for safety.
+    # if [ $SCAN_EXIT -eq 1 ]: Detects if Trivy found vulnerabilities. Instead of failing the build, it emits Azure DevOps' native logging hook:
+    # echo "##vso[task.logissue type=warning]..."
+    # This surfaces an orange/yellow warning banner on the PR overview screen and marks the job as Succeeded with issues.
+    # elif [ $SCAN_EXIT -ne 0 ]: Handles true runtime errors (such as Docker crashing, missing images, or malformed flags) while distinguishing them from vulnerability findings.
+    # exit 0: Forces the shell script to complete with return code 0, guaranteeing the stage stays running and downstream checks are not aborted.
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/trivy-reports
+
+              # 1. Disable set -e so bash doesn't abort when Trivy exits with 1
+              set +e
+
+              docker run --rm \
+                -v $(MAVEN_CACHE_FOLDER):/root/.m2/repository:ro \
+                -v $(Build.SourcesDirectory)/$(WORKING_DIR)/pom.xml:/pom.xml \
+                -v $(Build.ArtifactStagingDirectory)/trivy-reports:/reports \
+                aquasec/trivy:latest fs \
+                --severity HIGH,CRITICAL \
+                --format sarif \
+                --output /reports/trivy-report.sarif \
+                --exit-code 1 \
+                /pom.xml
+
+              SCAN_EXIT=$?
+              set -e
+
+              # 2. Evaluate exit code and log an Azure DevOps warning badge
+              if [ $SCAN_EXIT -eq 1 ]; then
+                echo "##vso[task.logissue type=warning]Trivy detected HIGH or CRITICAL vulnerabilities in cart pom.xml. Check the published report."
+              elif [ $SCAN_EXIT -ne 0 ]; then
+                echo "##vso[task.logissue type=warning]Trivy scan exited with unexpected error code $SCAN_EXIT."
+              fi
+
+              # 3. Always exit 0 to keep the pipeline moving
+              exit 0
+            displayName: 'Dependency Scanning (Trivy)'
+
+          # Save the SARIF report so you can inspect findings from the build summary
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Trivy SARIF Report'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/trivy-reports'
+              artifact: 'TrivyReports'
+              publishLocation: 'pipeline'
+            condition: always()
+
+ # =============================================================
+  # STAGE 3: Build, Scan & Publish (Runs ONLY on merge/push to dev/staging/main)
+  # =============================================================
+  - stage: BuildAndRelease
+    displayName: 'Package & Release Container'
+    dependsOn: Validate
+    # Only run if Stage 1 passes AND the commit is directly on the dev/staging/main branch
+    condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/dev', 'refs/heads/staging', 'refs/heads/main'))
+    jobs:
+      - job: DockerPipeline
+        displayName: 'Docker Build, Trivy Image Scan & ACR Push'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          # Build the local Docker image using Docker@2
+          - task: Docker@2
+            displayName: 'Build Cart Docker Image'
+            inputs:
+              containerRegistry: $(ACR_SERVICE_CONNECTION)
+              repository: $(IMAGE_REPOSITORY)
+              command: 'build'
+              Dockerfile: '$(WORKING_DIR)/Dockerfile'
+              buildContext: '$(WORKING_DIR)'
+              tags: |
+                $(Build.SourceVersion)
+                $(Build.SourceBranchName)
+
+# Scan the built local image using Trivy
+# Mount /var/run/docker.sock so the containerized Trivy can inspect the host's daemon images.
+# /var/run/docker.sock is the Unix socket (a special file) that the Docker daemon uses to communicate with the
+# Docker CLI. When you type docker images on a machine, the CLI sends an API request through this socket to the daemon.
+# The Trivy scanner is running inside its own isolated Docker container. If you just tell it to scan cart:$(Build.SourceVersion), Trivy will look inside its own container's local cache, fail to find the image, and crash.
+# By mapping the host agent's docker.sock into the Trivy container, you are giving the Trivy container a direct communication line to the host's Docker daemon. This allows Trivy to "see" and scan the cart image that was built in the previous pipeline step, without you having to push the image to a registry first.
+# set +e By default, Azure DevOps pipelines run bash scripts with set -e (exit immediately if any command fails). 
+# Trivy is configured to throw an error (--exit-code 1) if it finds vulnerabilities. set +e temporarily disables the instant-crash behavior so the script can capture the error and handle it gracefully.
+# -v $(Build.ArtifactStagingDirectory)...:/reports
+# Mounts the Azure staging directory into the Trivy container at /reports. When Trivy writes the SARIF file to /reports, it physically lands on the Azure agent's disk, ready to be published as a pipeline artifact.
+# aquasec/trivy:latest image ...The actual command. It tells Trivy to scan an image, only look for HIGH and CRITICAL severity CVEs, format the output for machines (sarif), and exit with code 1 if it finds anything.
+# SCAN_EXIT=$? Captures the exit code of the Docker run command into a variable (0 = passed, 1 = vulnerabilities found, other = crashed).
+# set -e Turns "exit on error" back on so the rest of the pipeline behaves normally.
+# echo "##vso[task.logissue type=warning]..."This is a special Azure DevOps logging command. If Trivy found vulnerabilities, instead of burying it in terminal text, this command forces a yellow warning box to appear directly in the Azure DevOps Pipeline summary UI.
+# exit 0 Forces this specific script step to pass successfully. Right now, this pipeline is configured in "Audit Mode"—it warns you about vulnerabilities but allows the image to be pushed to ACR anyway. If you change this to exit $SCAN_EXIT, the pipeline will strictly block and fail the deployment if vulnerabilities are found.
+# Writing report files to the staging folder (.../work/1/a) ensures generated scan files never contaminate your clean Git workspace, interfere with source diffs, or accidentally get packaged into final application JARs or Docker images.
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/trivy-image-reports
+              set +e
+
+              # Fetch full image tag generated by Docker@2 task
+              FULL_IMAGE_NAME="$(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):$(Build.SourceVersion)"
+              echo "Scanning local image: $FULL_IMAGE_NAME"
+
+              docker run --rm \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                -v $(Build.ArtifactStagingDirectory)/trivy-image-reports:/reports \
+                aquasec/trivy:latest image \
+                --severity HIGH,CRITICAL \
+                --format sarif \
+                --output /reports/trivy-image-report.sarif \
+                --exit-code 1 \
+                $FULL_IMAGE_NAME
+
+              SCAN_EXIT=$?
+              set -e
+
+              if [ $SCAN_EXIT -eq 1 ]; then
+                echo "##vso[task.logissue type=warning]Trivy detected HIGH or CRITICAL CVEs in the Docker image layers. Review the artifact report."
+              elif [ $SCAN_EXIT -ne 0 ]; then
+                echo "##vso[task.logissue type=warning]Trivy scan failed with runtime error code $SCAN_EXIT."
+              fi
+
+              # Set to exit 0 for warnings, or remove to strictly fail the push on CVEs
+              exit 0
+            displayName: 'Scan Container Image (Trivy)'
+
+          # 3. Publish Image Vulnerability Report
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Image Scan Report'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/trivy-image-reports'
+              artifact: 'DockerImageScanReports'
+              publishLocation: 'pipeline'
+            condition: always()
+
+          # 4. Push the image to ACR only if the build and scans were validated
+          - task: Docker@2
+            displayName: 'Push Cart Image to ACR'
+            inputs:
+              containerRegistry: $(ACR_SERVICE_CONNECTION)
+              repository: $(IMAGE_REPOSITORY)
+              command: 'push'
+              tags: |
+                $(Build.SourceVersion)
+                $(Build.SourceBranchName)
+
+# [ Build & Release ] 
+#         │
+#         ├── (if dev)     ──► [ Deploy Dev ]         (No approval)
+#         ├── (if staging) ──► [ Deploy Staging ]     (Optional QA approval)
+#         └── (if main)    ──► [ Deploy Production ]  (Strict manual approval gate)
+
+
+  # # =============================================================
+  # # STAGE 4: Deploy to DEV
+  # # =============================================================
+  # - stage: DeployDev
+  #   displayName: 'Deploy to Development'
+  #   dependsOn: BuildAndRelease
+  #   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/dev'))
+  #   jobs:
+  #     - deployment: DeployCartDev
+  #       displayName: 'Deploy Cart to Dev ACA'
+  #       environment: 'development' # Automatic execution (no gate)
+  #       strategy:
+  #         runOnce:
+  #           deploy:
+  #             steps:
+  #               - task: AzureContainerApps@1
+  #                 displayName: 'Update Container App (Dev)'
+  #                 inputs:
+  #                   azureSubscription: 'azure-resource-connection'
+  #                   containerAppName: 'cart-service-dev'
+  #                   resourceGroup: 'rg-microservices-dev'
+  #                   imageToDeploy: '$(ACR_NAME).azurecr.io/$(IMAGE_REPOSITORY):$(Build.SourceVersion)'
+
+  # # =============================================================
+  # # STAGE 5: Deploy to STAGING
+  # # =============================================================
+  # - stage: DeployStaging
+  #   displayName: 'Deploy to Staging'
+  #   dependsOn: BuildAndRelease
+  #   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/staging'))
+  #   jobs:
+  #     - deployment: DeployCartStaging
+  #       displayName: 'Deploy Cart to Staging ACA'
+  #       environment: 'staging'
+  #       strategy:
+  #         runOnce:
+  #           deploy:
+  #             steps:
+  #               - task: AzureContainerApps@1
+  #                 displayName: 'Update Container App (Staging)'
+  #                 inputs:
+  #                   azureSubscription: 'azure-resource-connection'
+  #                   containerAppName: 'cart-service-staging'
+  #                   resourceGroup: 'rg-microservices-staging'
+  #                   imageToDeploy: '$(ACR_NAME).azurecr.io/$(IMAGE_REPOSITORY):$(Build.SourceVersion)'
+
+  # # =============================================================
+  # # STAGE 6: Deploy to PRODUCTION (Requires UI Approval)
+  # # =============================================================
+  # - stage: DeployProduction
+  #   displayName: 'Deploy to Production'
+  #   dependsOn: BuildAndRelease
+  #   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  #   jobs:
+  #     - deployment: DeployCartProd
+  #       displayName: 'Deploy Cart to Production ACA'
+  #       environment: 'production' # UI Approval Check attached here
+  #       strategy:
+  #         runOnce:
+  #           deploy:
+  #             steps:
+  #               - task: AzureContainerApps@1
+  #                 displayName: 'Update Container App (Prod)'
+  #                 inputs:
+  #                   azureSubscription: 'azure-resource-connection'
+  #                   containerAppName: 'cart-service-prod'
+  #                   resourceGroup: 'rg-microservices-prod'
+  #                   imageToDeploy: '$(ACR_NAME).azurecr.io/$(IMAGE_REPOSITORY):$(Build.SourceVersion)'
+
+# Replace the repetitive deployment stages with a reusable template for better maintainability and consistency. The template will handle deployments to different environments based on parameters passed to it.
+
+  # - template: .azure-pipelines/templates/deploy-step.yml
+  #   parameters:
+  #     stageName: DeployDev
+  #     displayName: 'Deploy to Dev'
+  #     targetBranch: 'refs/heads/dev'
+  #     environmentName: 'development'
+  #     appName: 'cart-service-dev'
+  #     resourceGroup: 'rg-microservices-dev'
+
+  # - template: .azure-pipelines/templates/deploy-step.yml
+  #   parameters:
+  #     stageName: DeployProd
+  #     displayName: 'Deploy to Production'
+  #     targetBranch: 'refs/heads/main'
+  #     environmentName: 'production'
+  #     appName: 'cart-service-prod'
+  #     resourceGroup: 'rg-microservices-prod'
+
+
+
+# Environments" title="Create the Environments">
+# In Azure DevOps left sidebar, go to Pipelines -> Environments.
+# Click New environment and create three environments: development, staging, and production (choose None for resource type)
+# All three environment names will appear in the Environments list
+# Add Approval Gate to Production:Approvals & Checks.
+# Click into the production environment.Click the three dots (...) in the top right corner and select Approvals and checks.Click + and choose Approvals.
+# Add your name or your team group in the Approvers field.
+# Uncheck "Allow approvers to approve their own runs" if you want a second pair of eyes, or leave it checked for personal testing.
+# Click Create.Verification: When code merges to main, Stage 6 will automatically transition to "Waiting for approval" and send you an email/UI notification before deploying.

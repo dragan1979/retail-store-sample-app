@@ -1,0 +1,294 @@
+trigger:
+  branches:
+    include:
+      - dev
+      - main
+      - staging
+  paths:
+    include:
+      - src/checkout/**
+      - .azure-pipelines/checkout-ci.yml
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+
+variables:
+  WORKING_DIR: 'src/checkout'
+  ACR_SERVICE_CONNECTION: 'AKS-Connection'
+  ACR_LOGIN_SERVER: 'my2026registry.azurecr.io'
+  IMAGE_REPOSITORY: 'checkout' # Name of your Azure Container Registry Repository  
+  # YARN_CACHE_FOLDER is an environment variable that tells Yarn where to store downloaded package archives on disk instead of using its default system path. In CI/CD platforms like Azure DevOps, pointing it to $(Pipeline.Workspace)/.yarn/cache relocates that storage into the current pipeline's working directory.
+  # The folder stores immutable, compressed package archives downloaded from the registry:
+  # Yarn Classic (v1): Compressed .tgz tarballs along with integrity metadata for every dependency resolved by your project.
+  # Yarn Modern / Berry (v2+): Compressed .zip archives (e.g., lodash-npm-4.17.21-3a4b5c.zip). Under Yarn Plug'n'Play (PnP), Node can even execute dependencies directly from these zip files without extracting them into a traditional node_modules directory.
+  # Enables Pipeline Caching: Hosted CI build agents are ephemeral—they are destroyed after each run. Placing the cache inside $(Pipeline.Workspace) allows CI caching tasks (like Azure's Cache@2) to save the folder to remote cloud storage and restore it on subsequent runs.
+  # Cuts Build Times: Pulling cached archives from disk or local pipeline storage takes seconds, eliminating the need to redownload hundreds of megabytes of npm packages over the network on every commit.
+  # Build Reliability & Rate Limits: Pipelines become resilient against external npm registry downtime, transient network timeouts, and corporate proxy throttles.
+  # Cross-Platform Consistency: By default, Yarn saves caches to OS-specific user profile paths (such as ~/.cache/yarn on Linux or %LOCALAPPDATA%/Yarn/Cache on Windows). Explicitly setting YARN_CACHE_FOLDER standardizes the cache location across Linux, macOS, and Windows build runners.
+
+  YARN_CACHE_FOLDER: $(Pipeline.Workspace)/.yarn/cache
+
+
+stages:
+  # =============================================================
+  # STAGE 1: Fast Feedback (Runs on EVERY push AND every PR)
+  # =============================================================
+  - stage: Validate
+    displayName: 'Test, Coverage & Build'
+    jobs:
+      - job: TestAndBuild
+        displayName: 'Node.js Test & Lint'
+        steps:
+          - task: NodeTool@0
+            displayName: 'Install Node.js 20.x'
+            inputs:
+              versionSpec: '20.x'
+
+          # Cache Yarn / npm dependencies across runs
+          # Listing both $(WORKING_DIR)/yarn.lock and $(WORKING_DIR)/package-lock.json ensures that whether someone commits a yarn.lock or a package-lock.json, the cache key automatically adapts to whichever lockfile exists in the directory.
+          # yarn.lock (for Yarn) and package-lock.json (for npm) record the exact versions, download locations, and cryptographic integrity hashes of every direct and transitive dependency in your project.
+          # While package.json declares intent (what your project wants), lockfiles represent the ground truth (the exact snapshot of what was actually installed).  Why They Are CriticalDeterministic Builds ("Works on My Machine" Prevention): Most packages in package.json specify loose version ranges using semver prefixes like ^ (e.g., "express": "^4.18.2") or ~. Without a lockfile, two developers or CI agents running install commands on different days will fetch different patch/minor versions, causing unreproducible bugs.
+          # Even if you pin your direct dependencies to exact numbers in package.json, their sub-dependencies (transitive dependencies) still declare ranges. 
+          # A lockfile freezes the entire recursive dependency tree so an upstream update cannot break your build.Every package entry contains a cryptographic checksum (SHA-512). When running npm ci or yarn install --frozen-lockfile, the package manager verifies downloaded archives against this hash, blocking compromised or altered packages from executing in your environment.
+          # In Azure DevOps, commands like npm ci and yarn install --immutable immediately fail if the code and lockfile do not match, preventing accidental dependency updates during pull request validations.
+          # Both files store the same core metadata in different syntax formats (JSON for npm, YAML-like syntax for Yarn).
+          # The absolute semantic version installed (e.g., 4.18.2 rather than ^4.18.0).
+          # Source URL (resolved): The exact registry endpoint or CDN URL from which the archive was fetched.
+          # The cryptographic SHA hash ensuring the downloaded file has not been modified.
+          # The explicit versions of child libraries required by that specific package.
+          # Without a lockfile, running an install today might grab version 1.0, while running it tomorrow grabs version 1.1 with a breaking bug. Lockfiles guarantee every developer and every CI build agent gets the exact same code.If a third-party package on the internet gets compromised, the package manager checks the file against the hash stored in the lockfile and refuses to install it if anything changed
+          - task: Cache@2
+            displayName: 'Cache Node Package Manager'
+            inputs:
+              key: 'node | "$(Agent.OS)" | $(WORKING_DIR)/yarn.lock, $(WORKING_DIR)/package-lock.json'
+              restoreKeys: |
+                node | "$(Agent.OS)"
+              path: $(YARN_CACHE_FOLDER)
+
+# mkdir -p $(YARN_CACHE_FOLDER) Creates the designated cache directory (and any parent directories) if it does not already exist.
+# This prevents the Cache@2 post-job archiving step from failing if a build produces an empty cache.
+# export YARN_ENABLE_GLOBAL_CACHE=false Tells Yarn Berry to disable saving packages into the system user folder (~/.yarn/berry/cache) and forces it into the local project/workspace cache directory instead.
+# export YARN_CACHE_FOLDER=$(YARN_CACHE_FOLDER) Points Yarn Berry to the exact folder tracked by the Azure DevOps Cache@2 task ($(Pipeline.Workspace)/.yarn/cache), ensuring package downloads are preserved across pipeline runs.
+# export YARN_NODE_LINKER=node-modules Forces Yarn Berry to extract packages into a standard node_modules directory rather than using Yarn's default Plug'n'Play (.pnp.cjs) system, preventing import resolution errors in NestJS and Jest.
+# corepack enable Enables Node.js's built-in manager to activate the exact Yarn 4 binary committed to your repository without needing a global installation.
+# if [ -f yarn.lock ]; then Evaluates whether the repository uses Yarn Berry by checking if yarn.lock is present in the working directory.
+# yarn install --immutable Installs dependencies strictly as pinned in yarn.lock without updating or rewriting the lockfile.
+# It fails immediately if package.json and yarn.lock are out of sync.
+# yarn test:ci || yarn test:integration --ci --coverage --reporters=default --reporters=jest-junit Runs the custom test:ci script if present in package.json. If it does not exist, it falls back to running test:integration with the required flags for non-interactive CI execution, coverage generation, and JUnit XML output.
+# else Executes the alternative path if yarn.lock is not found, assuming the project uses npm.
+# npm ci Installs exact dependencies directly from package-lock.json, wiping any existing node_modules for a clean
+# install.  
+# npm run test:ci || npm run test:integration -- --ci --coverage --reporters=default --reporters=jest-junit
+# The npm equivalent test execution. The bare -- forwards the subsequent reporting flags directly to Jest instead of consuming them in npm.
+# fi Closes the if/else block.echo "Checking for generated test files:"Prints an informational header to the pipeline logs to simplify debugging.
+# find . -name "junit.xml" -o -name "cobertura-coverage.xml" Searches the working directory and outputs the physical location of generated report files to confirm their paths for subsequent publishing tasks.
+# workingDirectory: $(WORKING_DIR) Sets the root execution context to src/checkout so commands target the service rather than the monorepo root.
+# CI: 'true' (Mandatory Name Convention):Virtually all Node test runners (Jest, Mocha) and build tools look explicitly for process.
+# env.CI. Setting this exact name disables terminal coloring, prevents watch-mode prompts from hanging the agent, and treats warnings as errors where configured.
+# JEST_JUNIT_OUTPUT_DIR (Mandatory for jest-junit):The jest-junit library specifically queries process.
+# env.JEST_JUNIT_OUTPUT_DIR in its internal source code to decide which folder gets the generated XML.
+#  If you rename it to something arbitrary (e.g., MY_DIR), jest-junit will ignore it and default to the project
+# root.
+# JEST_JUNIT_OUTPUT_NAME (Mandatory for jest-junit):The jest-junit library specifically queries process.
+# env.JEST_JUNIT_OUTPUT_NAME to determine the output filename. Without this exact name, it defaults to its
+# built-in name (junit.xml).
+
+# yarn exec jest: Instead of looking at the "scripts" block inside package.json, this tells Yarn to dig directly into your node_modules folder, find the Jest binary, and run it.
+# --config ./test/jest-e2e.json: Since this service has no standard unit tests, this explicitly points Jest to the end-to-end integration test suite.
+# --ci: Tells Jest it is running on a build server. It disables interactive watch modes, turns off confusing console colors, and prevents the pipeline from hanging infinitely.
+# --coverage: Forces Jest to analyze how much of your code was executed during the tests and generates the cobertura-coverage.xml file.
+# --reporters=default --reporters=jest-junit: Tells Jest to do two things simultaneously: print the normal human-readable output to the pipeline console (default), and secretly write the machine-readable XML file (jest-junit) to the disk for Azure DevOps to consume
+
+
+          - script: |
+              # Ensure the cache directory exists so tar never fails
+              mkdir -p $(YARN_CACHE_FOLDER)
+
+              # Force Yarn Berry to use the pipeline cache directory
+              export YARN_ENABLE_GLOBAL_CACHE=false
+              export YARN_CACHE_FOLDER=$(YARN_CACHE_FOLDER)
+              export YARN_NODE_LINKER=node-modules
+
+              corepack enable
+
+              if [ -f yarn.lock ]; then
+                yarn install --immutable
+                # yarn test:ci || yarn test:integration --ci --coverage --reporters=default --reporters=jest-junit
+                # Execute Jest directly, bypassing package.json
+                yarn exec jest --config ./test/jest-e2e.json --ci --coverage --reporters=default --reporters=jest-junit
+              else
+                npm ci
+                # npm run test:ci || npm run test:integration -- --ci --coverage --reporters=default --reporters=jest-junit
+                # Execute Jest directly, bypassing package.json
+                npx jest --config ./test/jest-e2e.json --ci --coverage --reporters=default --reporters=jest-junit
+              fi
+
+              # Verify generated test reports
+              echo "Checking for generated test files:"
+              find . -name "junit.xml" -o -name "cobertura-coverage.xml"
+            workingDirectory: $(WORKING_DIR)
+            displayName: 'Install Dependencies & Run Tests'
+            env:
+              CI: 'true'
+              JEST_JUNIT_OUTPUT_DIR: '$(Build.SourcesDirectory)/$(WORKING_DIR)'
+              JEST_JUNIT_OUTPUT_NAME: 'junit.xml'
+
+          # Publish JUnit test results using recursive search
+          - task: PublishTestResults@2
+            displayName: 'Publish Unit Test Results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              searchFolder: '$(Build.SourcesDirectory)/$(WORKING_DIR)'
+              testResultsFiles: '**/junit.xml'
+              failTaskOnFailedTests: true
+            condition: always()
+
+          # Publish Code Coverage
+          - task: PublishCodeCoverageResults@2
+            displayName: 'Publish Code Coverage'
+            inputs:
+              summaryFileLocation: '$(Build.SourcesDirectory)/$(WORKING_DIR)/coverage/cobertura-coverage.xml'
+            condition: always()
+
+  # =============================================================
+  # STAGE 2: Security Gates (Runs ONLY on Pull Requests)
+  # =============================================================
+  - stage: Security
+    displayName: 'Security Gates (PR Only)'
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: SecurityScans
+        displayName: 'Secret Detection & Node SCA'
+        steps:
+          # 1. Secret Detection across repository
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/gitleaks-reports
+
+              docker run --rm \
+                -v $(Build.SourcesDirectory):/repo \
+                -v $(Build.ArtifactStagingDirectory)/gitleaks-reports:/reports \
+                zricethezav/gitleaks:latest detect \
+                --source="/repo" \
+                -v --redact \
+                --report-path="/reports/gitleaks-report.json" \
+                --report-format="json"
+            continueOnError: true
+            displayName: 'Secret Detection (Gitleaks)'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Gitleaks Report'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/gitleaks-reports'
+              artifact: 'SecurityReports-Checkout'
+              publishLocation: 'pipeline'
+            condition: always()
+
+          # 2. Dependency Vulnerability Scanning (package.json / yarn.lock)
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/trivy-reports
+              set +e
+
+              docker run --rm \
+                -v $(Build.SourcesDirectory)/$(WORKING_DIR):/src \
+                -v $(Build.ArtifactStagingDirectory)/trivy-reports:/reports \
+                aquasec/trivy:latest fs \
+                --severity HIGH,CRITICAL \
+                --format sarif \
+                --output /reports/trivy-checkout-fs.sarif \
+                --exit-code 1 \
+                /src
+
+              SCAN_EXIT=$?
+              set -e
+
+              if [ $SCAN_EXIT -eq 1 ]; then
+                echo "##vso[task.logissue type=warning]Trivy detected HIGH or CRITICAL CVEs in checkout dependencies."
+              elif [ $SCAN_EXIT -ne 0 ]; then
+                echo "##vso[task.logissue type=warning]Trivy scan exited with runtime error code $SCAN_EXIT."
+              fi
+
+              exit 0
+            displayName: 'Dependency Scanning (Trivy FS)'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Trivy Dependency Report'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/trivy-reports'
+              artifact: 'TrivyCheckoutFSReports'
+              publishLocation: 'pipeline'
+            condition: always()
+
+  # =============================================================
+  # STAGE 3: Build & Scan Container (dev, staging, main)
+  # =============================================================
+  - stage: BuildAndRelease
+    displayName: 'Package & Release Container'
+    # Only run if Stage 1 passes AND the commit is directly on the dev/staging/main branch
+    dependsOn: Validate
+    condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/dev', 'refs/heads/staging', 'refs/heads/main'))
+    jobs:
+      - job: DockerPipeline
+        displayName: 'Docker Build, Trivy Image Scan & ACR Push'
+        steps:
+          # 1. Build Container Image
+          - task: Docker@2
+            displayName: 'Build Checkout Docker Image'
+            inputs:
+              containerRegistry: $(ACR_SERVICE_CONNECTION)
+              repository: $(IMAGE_REPOSITORY)
+              command: 'build'
+              Dockerfile: '$(WORKING_DIR)/Dockerfile'
+              buildContext: '$(WORKING_DIR)'
+              tags: |
+                $(Build.SourceVersion)
+                $(Build.SourceBranchName)
+
+          # 2. Scan Built Image
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/trivy-image-reports
+              set +e
+
+              FULL_IMAGE_NAME="$(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):$(Build.SourceVersion)"
+
+              docker run --rm \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                -v $(Build.ArtifactStagingDirectory)/trivy-image-reports:/reports \
+                aquasec/trivy:latest image \
+                --severity HIGH,CRITICAL \
+                --format sarif \
+                --output /reports/trivy-checkout-image.sarif \
+                --exit-code 1 \
+                $FULL_IMAGE_NAME
+
+              SCAN_EXIT=$?
+              set -e
+
+              if [ $SCAN_EXIT -eq 1 ]; then
+                echo "##vso[task.logissue type=warning]Trivy detected HIGH or CRITICAL CVEs in the Docker image layers."
+              fi
+
+              exit 0
+            displayName: 'Scan Container Image (Trivy Image)'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Image Scan Report'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/trivy-image-reports'
+              artifact: 'DockerImageScanReports-Checkout'
+              publishLocation: 'pipeline'
+            condition: always()
+
+        # Push to ACR
+          - task: Docker@2
+            displayName: 'Push Checkout Image to ACR'
+            inputs:
+              containerRegistry: $(ACR_SERVICE_CONNECTION)
+              repository: $(IMAGE_REPOSITORY)
+              command: 'push'
+              tags: |
+                $(Build.SourceVersion)
+                $(Build.SourceBranchName)
+
+

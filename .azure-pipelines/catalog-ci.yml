@@ -1,0 +1,271 @@
+trigger:
+  branches:
+    include:
+      - dev
+      - main
+      - staging
+  paths:
+    include:
+      - src/catalog/**
+      - .azure-pipelines/catalog-ci.yml
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  WORKING_DIR: 'src/catalog'
+  ACR_SERVICE_CONNECTION: 'AKS-Connection' # Name of your Azure DevOps Docker Service Connection
+  ACR_LOGIN_SERVER: 'my2026registry.azurecr.io'
+  IMAGE_REPOSITORY: 'catalog' # Name of your Azure Container Registry Repository
+
+stages:
+  # =============================================================
+  # STAGE 1: Fast Feedback (Runs on EVERY push AND every MR)
+  # =============================================================
+  - stage: Validate
+    displayName: 'Test, Coverage & Lint'
+    jobs:
+      - job: TestAndLint
+        steps:
+        - task: GoTool@0
+          displayName: 'Ensure Go Version'
+          inputs:
+            version: '1.24'
+
+      #This command dynamically asks the Go runtime where it caches downloaded packages on the build agent, 
+      # then exports that directory path into an Azure DevOps pipeline variable named GO_CACHE_PATH so later steps can use it.
+      # GOMODCACHE is an environment variable introduced in Go 1.15 that specifies the directory where the Go toolchain stores downloaded module dependencies.
+        - script: |
+           echo "##vso[task.setvariable variable=GO_CACHE_PATH]$(go env GOMODCACHE)"
+          displayName: 'Detect Go Cache Path'
+
+        - task: Cache@2
+          displayName: 'Cache Go Modules'
+          inputs:
+            key: 'go | "$(Agent.OS)" | $(WORKING_DIR)/go.sum'
+            restoreKeys: |
+              go | "$(Agent.OS)"
+            path: $(GO_CACHE_PATH)
+
+
+      # go-junit-report: Converts standard Go test output into JUnit XML for the Tests tab.
+      # gocov & gocov-xml: Converts Go's coverage.txt into Cobertura XML for the Code Coverage tab.
+      # export PATH=$PATH:$(go env GOPATH)/bin-This command adds Go's compiled binary directory to the shell's search path ($PATH) so that CLI tools downloaded via go install can be executed directly by name.
+      # go mod download Pre-fetches all dependencies declared in go.mod into the agent's cache (GOMODCACHE).
+      # Pre-downloading guarantees all remote modules exist locally so subsequent commands execute offline without network timeouts or mid-build interruptions.
+      # go vet ./...Go’s official static analyzer. It inspects code without running it to catch common bugs and subtle anti-patterns (such as unreachable code, mismatched printf format verbs, mutex lock copying, or malformed struct tags).
+      # ./...: A Go wildcard pattern that means "scan this directory and every subpackage recursively."
+      # go test -v -race -coverprofile=coverage.txt -covermode=atomic ./... Executes all unit and integration tests across the entire package tree with strict concurrency and coverage checks:
+      # -race (Data Race Detector): Instruments the compiled test binary with Go’s runtime race detector. It halts the test and reports a build failure if two goroutines access shared memory simultaneously without proper synchronization (channels or mutexes).
+      # -coverprofile=coverage.txt: Directs Go to calculate code coverage during the test run and write the line-by-line coverage metrics to coverage.txt.
+      # 2>&1 (Redirect Stderr to Stdout) In Linux/Bash, 1 represents Standard Output (stdout) and 2 represents Standard Error (stderr). By default, pipes (|) only forward stdout. Writing 2>&1 combines stderr into stdout so panic stack traces, compiler errors, or test error logs are captured rather than bypassing the reporter.
+      # -covermode=atomic: Configures coverage counters to use thread-safe atomic operations. This is mandatory whenever -race is enabled, because multiple concurrent goroutines writing to coverage counters simultaneously would otherwise trigger false data race alerts.
+      # -coverpkg=./... Instructs the Go compiler to run all tests in the entire repository, regardless of which package is running the test,the Go test runner looks for any file ending in _test.go. When test/controller_test.go executes an HTTP request that touches controller and queries repository, Go records every line executed across both packages.
+      # go-junit-report -set-exit-code Parses the plain-text Go test stream and generates JUnit-compliant XML.
+      # -set-exit-code is critical: By default, standard Unix pipes mask upstream errors (the pipeline would only return the exit code of the final command). Without this flag, go-junit-report would generate the XML and exit with code 0, causing Azure DevOps to mark the step as green/passed even if several Go tests actually failed. -set-exit-code forces it to exit with 1 if any test in the stream failed.
+      # If go vet discovers an error, or if any unit test or data race check fails, the command exits with a non-zero code. Azure Pipelines will immediately fail the Validate stage and cancel subsequent Docker build/push stages, preventing flawed binaries from reaching ACR.
+      
+        - script: |
+            go install github.com/jstemmer/go-junit-report/v2@latest
+            go install github.com/axw/gocov/gocov@latest
+            go install github.com/AlekSi/gocov-xml@latest
+
+            export PATH=$PATH:$(go env GOPATH)/bin
+
+            go mod download
+            go vet ./...
+
+            # Run tests, tee console output, and generate JUnit XML
+            go test -v -race -coverpkg=./... -coverprofile=coverage.txt -covermode=atomic ./... 2>&1 | go-junit-report -set-exit-code > test-report.xml
+
+            # Convert coverage.txt to Cobertura XML format
+            gocov convert coverage.txt | gocov-xml > coverage.xml
+          workingDirectory: $(WORKING_DIR)
+          displayName: 'Run Tests, Vet & Generate Reports'
+
+        # Publish test results to the "Tests" tab
+        - task: PublishTestResults@2
+          displayName: 'Publish Unit Test Results'
+          inputs:
+            testResultsFormat: 'JUnit'
+            testResultsFiles: '$(WORKING_DIR)/test-report.xml'
+            failTaskOnFailedTests: true
+          condition: always()
+
+        # Publish coverage metrics to the "Code Coverage" tab
+        - task: PublishCodeCoverageResults@2
+          displayName: 'Publish Code Coverage'
+          inputs:
+            summaryFileLocation: '$(WORKING_DIR)/coverage.xml'
+          condition: always()
+
+    
+# =============================================================
+# STAGE 2: Security Gates (Runs ONLY on Pull Requests)
+# =============================================================
+  - stage: Security
+    displayName: 'Security Gates (PR Only)'
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: SecurityScans
+        displayName: 'Secret Detection & Go SCA'
+        steps:
+
+          - task: GoTool@0
+            displayName: 'Ensure Go Version'
+            inputs:
+              version: '1.24'
+
+        # -v $(Build.SourcesDirectory):/repo Shares your Git repository from the agent host into /repo inside the container so Gitleaks can inspect your source code and commit history.
+        # The Output (-v $(Build.ArtifactStagingDirectory)/gitleaks-reports:/reports)
+        # Provides a persistent bridge from inside the container (/reports) to the agent host's staging directory ($(Build.ArtifactStagingDirectory)). When Gitleaks writes gitleaks-report.json, the file lands safely on the host VM so Azure DevOps can publish it
+          
+          # Secret Detection across the repo
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/gitleaks-reports
+              docker run --rm \
+                -v $(Build.SourcesDirectory):/repo \
+                -v $(Build.ArtifactStagingDirectory)/gitleaks-reports:/reports \
+                zricethezav/gitleaks:latest detect \
+                --source="/repo" \
+                -v --redact \
+                --report-path="/reports/gitleaks-report.json" \
+                --report-format="json"
+            continueOnError: true
+            displayName: 'Secret Detection (Gitleaks)'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Gitleaks Report'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/gitleaks-reports'
+              artifact: 'SecurityReports-Catalog'
+              publishLocation: 'pipeline'
+            condition: always()
+
+        # Cache not neeed because go.sum has all the data already: Unlike Maven (which often requires running dependency:resolve to calculate inherited versions from parent POMs), Go records the complete, flattened dependency tree and exact versions directly inside go.mod and go.sum.  Static analysis only: aquasec/trivy:latest fs simply reads those two plain-text files. It never downloads modules, does not compile anything, and does not look inside Go's module cache directory (GOMODCACHE).  
+
+          # Filesystem Dependency Scanning on go.mod / go.sum
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/trivy-reports
+              set +e
+
+              docker run --rm \
+                -v $(Build.SourcesDirectory)/$(WORKING_DIR):/src \
+                -v $(Build.ArtifactStagingDirectory)/trivy-reports:/reports \
+                aquasec/trivy:latest fs \
+                --severity HIGH,CRITICAL \
+                --format sarif \
+                --output /reports/trivy-catalog-fs.sarif \
+                --exit-code 1 \
+                /src
+
+              SCAN_EXIT=$?
+              set -e
+
+              if [ $SCAN_EXIT -eq 1 ]; then
+                echo "##vso[task.logissue type=warning]Trivy detected HIGH or CRITICAL CVEs in catalog dependencies."
+              fi
+              exit 0
+            displayName: 'Dependency Scanning (Trivy FS)'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Trivy Dependency Report'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/trivy-reports'
+              artifact: 'TrivyCatalogFSReports'
+              publishLocation: 'pipeline'
+            condition: always()
+            
+
+
+  # =============================================================
+  # STAGE Package & Release (dev, staging, main)
+  # =============================================================
+  - stage: BuildAndRelease
+    displayName: 'Package & Release Container'
+    dependsOn: Validate
+     # Only run if Stage 1 passes AND the commit is directly on the dev/staging/main branch
+    condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/dev', 'refs/heads/staging', 'refs/heads/main'))
+    jobs:
+      - job: DockerPipeline
+        displayName: 'Docker Build, Trivy Scan & ACR Push'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+        # Build the local image
+        - task: Docker@2
+          displayName: 'Build Catalog Docker Image'
+          inputs:
+            containerRegistry: $(ACR_SERVICE_CONNECTION)
+            repository: $(IMAGE_REPOSITORY)
+            command: 'build'
+            Dockerfile: '$(WORKING_DIR)/Dockerfile'
+            buildContext: '$(WORKING_DIR)'
+            tags: |
+              $(Build.SourceVersion)
+              $(Build.SourceBranchName)
+
+        # set +e Disables the shell's default "exit immediately on error" behavior. This is critical because Trivy will intentionally return an error exit code if it finds vulnerabilities; without set +e, the script would terminate instantly before processing the results.
+        # -v /var/run/docker.sock:/var/run/docker.sock Mounts the build agent's Docker daemon socket into the Trivy container. This grants Trivy access to inspect images stored in the local Docker engine cache without needing to push or pull from a remote registry.
+        # -v $(Build.ArtifactStagingDirectory)/trivy-image-reports:/reports Mounts the host directory created earlier to /reports inside the container so reports written inside the container persist on the agent host.
+        # aquasec/trivy:latest image Downloads and invokes the official Aqua Security Trivy container and sets the scanning target to container image mod
+        # --severity HIGH,CRITICAL Filters scan results to only flag serious vulnerabilities (HIGH and CRITICAL CVEs), ignoring low and medium noise.
+        # --format sarif Formats the output as SARIF (Static Analysis Results Interchange Format), an industry-standard JSON schema supported by security scanners and Azure DevOps extensions.
+        # --output /reports/trivy-catalog-report.sarif Instructs Trivy to write the SARIF file to the mounted volume at /reports/trivy-catalog-report.sarif.
+        # --exit-code 1 Configures Trivy to exit with return code 1 if any CVEs matching --severity are discovered, or 0 if clean.
+        # SCAN_EXIT=$? Captures the exit code of the docker run command into a local variable ($? always holds the return status of the last executed command).set -e
+        # Re-enables strict "exit on error" behavior for the rest of the script.
+        # if [ $SCAN_EXIT -eq 1 ]; then Checks if Trivy exited with 1 (meaning vulnerabilities were found).
+        # echo "##vso[task.logissue type=warning]Trivy detected HIGH or CRITICAL CVEs in the Docker image layers."
+        # Emits an Azure Pipelines logging command. This prints an official visual warning badge on the pipeline run summary page without failing the build.
+        # elif [ $SCAN_EXIT -ne 0 ]; then Checks if the command failed with any code other than 0 or 1 (such as a Docker daemon crash, an invalid image name, or an out-of-memory error).
+        #echo "##vso[task.logissue type=warning]Trivy scan failed with runtime error code $SCAN_EXIT."Logs a warning that the tool itself crashed or failed to execute properly.
+        # exit 0 Forces the step to finish with exit code 0, ensuring the pipeline continues onward to publish reports and push the container image to ACR rather than failing the build stage.
+        - script: |
+            mkdir -p $(Build.ArtifactStagingDirectory)/trivy-image-reports
+            set +e
+
+            FULL_IMAGE_NAME="$(ACR_LOGIN_SERVER)/$(IMAGE_REPOSITORY):$(Build.SourceVersion)"
+
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v $(Build.ArtifactStagingDirectory)/trivy-image-reports:/reports \
+              aquasec/trivy:latest image \
+              --severity HIGH,CRITICAL \
+              --format sarif \
+              --output /reports/trivy-catalog-report.sarif \
+              --exit-code 1 \
+              $FULL_IMAGE_NAME
+
+            SCAN_EXIT=$?
+            set -e
+
+            if [ $SCAN_EXIT -eq 1 ]; then
+              echo "##vso[task.logissue type=warning]Trivy detected HIGH or CRITICAL CVEs in the Docker image layers."
+            elif [ $SCAN_EXIT -ne 0 ]; then
+              echo "##vso[task.logissue type=warning]Trivy scan failed with runtime error code $SCAN_EXIT."
+            fi
+
+            exit 0
+          displayName: 'Scan Container Image (Trivy)'
+
+        # Publish report
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish Image Scan Report'
+          inputs:
+            targetPath: '$(Build.ArtifactStagingDirectory)/trivy-image-reports'
+            artifact: 'DockerImageScanReports-Catalog'
+            publishLocation: 'pipeline'
+          condition: always()
+
+        # Push to ACR
+        - task: Docker@2
+          displayName: 'Push Catalog Image to ACR'
+          inputs:
+            containerRegistry: $(ACR_SERVICE_CONNECTION)
+            repository: $(IMAGE_REPOSITORY)
+            command: 'push'
+            tags: |
+              $(Build.SourceVersion)
+              $(Build.SourceBranchName)

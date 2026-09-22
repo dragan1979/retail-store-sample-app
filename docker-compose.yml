@@ -1,0 +1,317 @@
+services:
+  ######### cart service #################
+  cart:
+    image: retail-cart-service:latest
+    build:
+      context: ./src/cart
+      dockerfile: Dockerfile
+      secrets:
+        - AZURE_PAT
+    # don't pull non-existing images
+    pull_policy: build
+    hostname: carts
+    
+    # Drops every Linux kernel capability from the container process
+    cap_drop:
+      - all
+    # Explicitly grants back a single capability: binding to privileged network ports (ports below 1024, such as 80 or 443).
+    cap_add:
+      - NET_BIND_SERVICE
+    # Mounts the container's root filesystem (/) as strictly read-only.
+    read_only: true
+    security_opt:
+    # Prevents processes inside the container from escalating their privileges via setuid or setgid binaries on docker runtime
+      - no-new-privileges:true
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+      - SPRING_DATA_REDIS_HOST=carts-redis
+      - SPRING_DATA_REDIS_PORT=6379
+      # JAVA_TOOL_OPTIONS is a built-in environment variable that the Java Virtual Machine automatically scans
+      # and applies at startup, without requiring modifications to the java -jar command in the Dockerfile. 
+      # Setting -Djava.io.tmpdir=/tmp forces Java and embedded Tomcat to use /tmp as their scratch workspace for extracting JAR resources, generating temporary files, and managing internal socket handles.
+      - JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=/tmp
+    # tmpfs: Tells Docker to mount a temporary, volatile filesystem stored directly in host memory (RAM) rather
+    # than writing to disk. This satisfies the requirement of read_only: true because the root filesystem stays immutable while the application gets a dedicated in-memory scratchpad that vanishes whenever the container stops.
+    tmpfs:
+    # Configures the exact Linux mount permissions for the in-memory mount:
+    # /tmp: The target mount point inside the container.
+    # rw: Mounts the directory as readable and writable.
+    # mode=1777: The standard Linux sticky-bit directory permissions (rwxrwxrwt). It allows any user to create files inside /tmp while preventing users from deleting files owned by someone else.
+    # uid=1000,gid=1000: Explicitly assigns the folder ownership to user ID 1000 and group ID 1000 (appuser). Without this, Docker defaults to root:root ownership (0:0), which caused the earlier FileSystemException: Read-only file system error.
+      - /tmp:rw,mode=1777,uid=1000,gid=1000
+    ports:
+      - 8082:8080
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      carts-redis:
+        condition: service_healthy
+
+  carts-redis:
+    image: redis:7-alpine
+    hostname: carts-redis
+    restart: always
+    volumes:
+      - cart-redis:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - all
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+######### catalog service #################
+
+  catalog:
+    image: retail-catalog-service:latest
+    build:
+      context: ./src/catalog
+      dockerfile: Dockerfile
+      secrets:
+          - AZURE_PAT
+    # don't pull non-existing images
+    pull_policy: build
+    hostname: catalog
+    restart: always
+    cap_drop:
+      - all
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid
+    depends_on:
+      catalog-db:
+        condition: service_healthy
+        restart: true
+  
+    environment:
+      - GIN_MODE=release
+      - reschedule=on-node-failure
+      - RETAIL_CATALOG_PERSISTENCE_PROVIDER=mysql
+      - RETAIL_CATALOG_PERSISTENCE_PASSWORD=${MYSQL_PASSWORD}
+      - RETAIL_CATALOG_PERSISTENCE_ENDPOINT=catalog-db:3306
+   
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+    
+
+  catalog-db:
+    image: mariadb:10.11 # or mysql:8.0
+    hostname: catalog-db
+    restart: always
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+    volumes:
+      - catalog-db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+######### checkout service #################
+
+  checkout:
+    image: retail-checkout-service:latest
+    build:
+      context: ./src/checkout
+      dockerfile: Dockerfile
+      secrets:
+        - AZURE_PAT
+    # don't pull non-existing images
+    pull_policy: build
+    hostname: checkout
+    depends_on:
+      checkout-db:
+        condition: service_healthy
+        restart: true
+    restart: always
+    cap_drop:
+      - all
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - RETAIL_CHECKOUT_PERSISTENCE_PROVIDER=redis
+      - RETAIL_CHECKOUT_PERSISTENCE_REDIS_URL=redis://checkout-redis:6379
+    ports:
+      - "8005:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+  
+  checkout-db:
+    image: redis:7-alpine
+    hostname: checkout-redis
+    restart: always
+    volumes:
+      - checkout-redis:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - all
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+      
+
+######### orders service #################
+
+  orders:
+    image: retail-orders-service:latest
+    build:
+      context: ./src/orders
+      dockerfile: Dockerfile
+      secrets:
+        - AZURE_PAT
+    # don't pull non-existing images
+    pull_policy: build
+    hostname: orders
+    depends_on:
+      orders-db:
+        condition: service_healthy
+        restart: true
+    restart: always
+    cap_drop:
+      - all
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+      - RETAIL_ORDERS_PERSISTENCE_PROVIDER=postgres
+      - RETAIL_ORDERS_PERSISTENCE_ENDPOINT=orders-db:5432
+      - RETAIL_ORDERS_PERSISTENCE_NAME=orders
+      - RETAIL_ORDERS_PERSISTENCE_USERNAME=${POSTGRES_USER}
+      - RETAIL_ORDERS_PERSISTENCE_PASSWORD=${POSTGRES_PASSWORD}
+      - RETAIL_ORDERS_MESSAGING_PROVIDER=rabbitmq
+      - RETAIL_ORDERS_MESSAGING_RABBITMQ_ADDRESSES=rabbitmq:5672
+      - RETAIL_ORDERS_MESSAGING_RABBITMQ_USERNAME=rabbitmq
+      - RETAIL_ORDERS_MESSAGING_RABBITMQ_PASSWORD=${POSTGRES_PASSWORD}
+      # JAVA_TOOL_OPTIONS is a built-in environment variable that the Java Virtual Machine automatically scans
+      # and applies at startup, without requiring modifications to the java -jar command in the Dockerfile. 
+      # Setting -Djava.io.tmpdir=/tmp forces Java and embedded Tomcat to use /tmp as their scratch workspace for extracting JAR resources, generating temporary files, and managing internal socket handles.
+      - JAVA_TOOL_OPTIONS=-Djava.io.tmpdir=/tmp
+    ports:
+      - "8084:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  orders-db:
+    image: postgres:16.1
+    hostname: orders-db
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - reschedule=on-node-failure
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=orders
+      - POSTGRES_USER=${POSTGRES_USER}
+    ports:
+      - "5432:5432"
+    volumes:
+      - orders-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d orders -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+   
+  rabbitmq:
+    image: rabbitmq:3-management
+    hostname: rabbitmq
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    environment:
+      - RABBITMQ_DEFAULT_USER=rabbitmq
+      - RABBITMQ_DEFAULT_PASS=${POSTGRES_PASSWORD}
+    ports:
+      - "61616:61616"
+      - "8161:8161"
+  
+
+#### ui service #################
+
+  ui:
+    image: retail-ui-service:latest
+    build:
+      context: ./src/ui
+      dockerfile: Dockerfile
+      secrets:
+        - AZURE_PAT
+    # don't pull non-existing images
+    pull_policy: build
+    hostname: ui
+    restart: always
+    mem_limit: 512m
+    cap_drop:
+      - all
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - JAVA_OPTS=-XX:MaxRAMPercentage=75.0 -Djava.security.egd=file:/dev/urandom
+      - SERVER_TOMCAT_ACCESSLOG_ENABLED=true
+      - SPRING_PROFILES_ACTIVE=prod
+    ports:
+      - "8888:8080"
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -f http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  cart-redis:
+  catalog-db-data:
+  checkout-redis:
+  orders-db-data:
+  rabbitmq-data:
+secrets:
+  AZURE_PAT:
+    # Look at the host system for an environment variable named AZURE_PAT, and use whatever text it holds as the secret."
+    environment: "AZURE_PAT"
