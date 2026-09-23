@@ -30,9 +30,9 @@ This repository contains a microservices reference e-commerce application struct
 
 From an infrastructure and DevOps perspective, the repository functions as a modular monorepo:
 
-- **Decoupled Workflows**: Each microservice maintains its own build runtime, dependency definition, container lifecycle, and localized Helm/Compose manifests.
-- **Declarative Orchestration**: The top-level `src/app/` serves as the platform layer, consolidating individual service charts and containers into integrated environments via Helmfile, Docker Compose overlays, and Tilt.
-- **Ephemeral Testing Capabilities**: Persistence adapters allow services to pivot dynamically between lightweight, in-memory local state (or containerized mocks like DynamoDB Local / MySQL containers) and managed cloud resources (RDS, OpenSearch, DynamoDB) using environment variables.
+- **Decoupled Workflows**: Each microservice maintains its own build runtime, dependency definitions and container lifecycle.
+- **Declarative Orchestration**: The top-level `src/app/` serves as the platform layer, consolidating individual service charts and containers into integrated environments via Docker Compose overlays.
+- **Ephemeral Testing Capabilities**: Persistence adapters allow services to pivot dynamically between lightweight, in-memory local state (or containerized mocks like DynamoDB Local / MySQL containers)
 
 ## Docker & Containerization Patterns
 
@@ -46,7 +46,7 @@ Each service under `src/` packages an optimized Dockerfile tailored to its langu
 | Cart | `src/cart/` | Multi-stage Maven build | Eclipse Temurin / Corretto OpenJDK runtime | 8080 (Internal) / 8082 (Host) |
 | Orders | `src/orders/` | Multi-stage Maven/Gradle build | Minimal JRE base image | 8080 (Internal) / 8083 (Host) |
 | Checkout | `src/checkout/` | Multi-stage Node.js build | Node Alpine, dependencies pruned with production flags | 8080 (Internal) / 8084 (Host) |
-| UI | `src/ui/` | Multi-stage Vue build | Node build phase → NGINX unprivileged base server | 8080 (Internal) / 8080 (Host) |
+| UI | `src/ui/` | Multi-stage Vue build | Node build phase | 8080 (Internal) / 8080 (Host) |
 
 ### Docker Compose Architecture
 
