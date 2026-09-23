@@ -9,7 +9,7 @@ This repository contains a microservices reference e-commerce application struct
                                             │
                                             ▼
                       ┌───────────────────────────────────────────┐
-                      │    Azure DevOps Pipelines (.azure-pipelines)│
+                      │  Azure DevOps Pipelines (.azure-pipelines)│
                       └─────────────────────┬─────────────────────┘
                                             │
                         ┌───────────────────┼───────────────────┐
