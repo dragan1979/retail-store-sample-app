@@ -118,7 +118,4 @@ Centralized step template that abstracts:
 ```bash
 # Standard local setup with databases
 docker compose up -d
-
-# Overlay with OpenTelemetry distributed tracing
-docker compose -f src/app/docker-compose.yml -f src/app/docker-compose.tracing.yml up -d
 ```
