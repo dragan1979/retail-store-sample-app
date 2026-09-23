@@ -53,9 +53,6 @@ Each service under `src/` packages an optimized Dockerfile tailored to its langu
 The repository provides several compose topology layers:
 
 - **Root Compose** (`docker-compose.yml`): Primary bootstrapping topology that links all microservices and spun-up data containers (MySQL, PostgreSQL, RabbitMQ, DynamoDB Local, Redis).
-- **Application Compose** (`src/app/docker-compose.yml`): Explicit platform configuration managing service discovery and environment parameter injection.
-- **Observability Overlay** (`src/app/docker-compose.tracing.yml`): Layered onto base compose configurations to inject the OpenTelemetry (OTel) Collector and routing parameters for distributed trace collection.
-- **Compose Override** (`src/app/compose.override.yaml`): Overrides networking, local mount points, and live-reload volumes for active development.
 
 ## CI/CD Pipeline Architecture (`.azure-pipelines/`)
 
