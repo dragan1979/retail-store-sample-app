@@ -14,6 +14,7 @@ services:
     environment:
       - RETAIL_CHECKOUT_PERSISTENCE_PROVIDER=redis
       - RETAIL_CHECKOUT_PERSISTENCE_REDIS_URL=redis://checkout-redis:6379
+      - RETAIL_CHECKOUT_ORDERS=http://orders:8080
     ports:
       - '8085:8080'
     healthcheck:
