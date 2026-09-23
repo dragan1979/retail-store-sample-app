@@ -6,6 +6,12 @@ services:
       - JAVA_OPTS=-XX:MaxRAMPercentage=75.0 -Djava.security.egd=file:/dev/urandom
       - SERVER_TOMCAT_ACCESSLOG_ENABLED=true
       - RETAIL_UI_SEARCH_ENABLED=${SEARCH_ENABLED:-false}
+      - SERVER_TOMCAT_ACCESSLOG_ENABLED=true
+      - RETAIL_UI_SEARCH_ENABLED=${SEARCH_ENABLED:-false}
+      - RETAIL_UI_ENDPOINTS_CATALOG=http://catalog:8080
+      - RETAIL_UI_ENDPOINTS_CARTS=http://carts:8080
+      - RETAIL_UI_ENDPOINTS_ORDERS=http://orders:8080
+      - RETAIL_UI_ENDPOINTS_CHECKOUT=http://checkout:8080
     hostname: ui
     build:
       context: .
