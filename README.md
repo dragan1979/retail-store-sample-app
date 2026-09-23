@@ -116,6 +116,11 @@ Centralized step template that abstracts:
 ### Bring up Full Stack via Docker Compose
 
 ```bash
+# Export Azure feed Pesronal access token (PAT) to environment variable (i ran this on Windows)
+$env:AZURE_PAT="your-pat"
+$env:AZURE_PAT = [System.Environment]::GetEnvironmentVariable('AZURE_PAT', 'User')
+# Local test invidiual dockerfile
+docker build --secret id=AZURE_PAT,env=AZURE_PAT -t my-cart-service:latest .
 # Standard local setup with databases
 docker compose up -d
 ```
