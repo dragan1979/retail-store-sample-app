@@ -22,10 +22,10 @@ This repository contains a microservices reference e-commerce application struct
                                             ▼
                                   Container Registry
                                             │
-                 ┌──────────────────────────┴──────────────────────────┐
-                 ▼                                                     ▼
-        Local Container Runtime                                Kubernetes Cluster
-     (Docker Compose / Tilt Dev)                             (Helm / Helmfile Deploy)
+                                            |
+                                            ▼                          
+                                  Local Container Runtime                               
+                                     (Docker Compose)                             
 ```
 
 From an infrastructure and DevOps perspective, the repository functions as a modular monorepo:
